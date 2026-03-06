@@ -23,7 +23,8 @@ from flashinfer_bench import Benchmark, BenchmarkConfig, Solution, TraceSet
 app = modal.App("flashinfer-bench")
 
 trace_volume = modal.Volume.from_name("flashinfer-trace", create_if_missing=True)
-TRACE_SET_PATH = "/data"
+VOLUME_MOUNT_PATH = "/data"
+TRACE_SET_PATH = "/data/mlsys26-contest"
 
 image = (
     modal.Image.debian_slim(python_version="3.12")
@@ -31,7 +32,7 @@ image = (
 )
 
 
-@app.function(image=image, gpu="B200:1", timeout=3600, volumes={TRACE_SET_PATH: trace_volume})
+@app.function(image=image, gpu="B200:1", timeout=3600, volumes={VOLUME_MOUNT_PATH: trace_volume})
 def run_benchmark(solution: Solution, config: BenchmarkConfig = None) -> dict:
     """Run benchmark on Modal B200 and return results."""
     if config is None:
@@ -75,6 +76,9 @@ def run_benchmark(solution: Solution, config: BenchmarkConfig = None) -> dict:
             if trace.evaluation.correctness:
                 entry["max_abs_error"] = trace.evaluation.correctness.max_absolute_error
                 entry["max_rel_error"] = trace.evaluation.correctness.max_relative_error
+            # Include log for debugging errors
+            if trace.evaluation.log:
+                entry["log"] = trace.evaluation.log[:1000]  # First 1000 chars
             results[definition.name][trace.workload.uuid] = entry
 
     return results
@@ -100,6 +104,10 @@ def print_results(results: dict):
                 print(f" | abs_err={abs_err:.2e}, rel_err={rel_err:.2e}", end="")
 
             print()
+
+            # Print log for failed workloads
+            if status != "PASSED" and result.get("log"):
+                print(f"    Log: {result['log'][:500]}")
 
 
 @app.local_entrypoint()

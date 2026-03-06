@@ -1,210 +1,165 @@
 """
-Triton Kernel Template for FlashInfer Competition.
-
-Implement your kernel logic here. The entry point function name should match
-the `entry_point` setting in config.toml.
-
-See the track definition for required function signature and semantics.
+DSA Sparse Attention Kernel - Fixed for Triton 3.x and B200.
+Handles sparse attention with TopK KV cache selection.
+Uses online softmax algorithm for numerical stability.
 """
-
+from typing import Tuple
+import torch
 import triton
 import triton.language as tl
-import torch
-import math
 
-# 定义常量以提高可读性
-BLOCK_N = 64  # 每个循环块处理的KV token数量
-HEAD_DIM_CKV = 512
-HEAD_DIM_KPE = 64
-TOPK = 2048
-NUM_HEADS = 16
 
 @triton.jit
-def _kernel_dsa_sparse(
-    # Pointers
-    Q_Nope_ptr, Q_Pe_ptr,
-    CKV_ptr, KPE_ptr,
-    Indices_ptr,
-    Out_ptr, Lse_ptr,
-    # Strides
-    stride_qn_t, stride_qn_h, stride_qn_d,
-    stride_qp_t, stride_qp_h, stride_qp_d,
-    stride_ckv_p, stride_ckv_ps, stride_ckv_d,
-    stride_kpe_p, stride_kpe_ps, stride_kpe_d,
-    stride_idx_t, stride_idx_k,
-    stride_out_t, stride_out_h, stride_out_d,
-    stride_lse_t, stride_lse_h,
-    # Scalars
-    sm_scale,
-    # Consts
-    BLOCK_N: tl.constexpr,
+def _dsa_sparse_attention_kernel(
+    q_nope_ptr, q_pe_ptr, ckv_ptr, kpe_ptr, indices_ptr, output_ptr, lse_ptr,
+    stride_qn_b, stride_qn_h, stride_qn_d,
+    stride_qp_b, stride_qp_h, stride_qp_d,
+    stride_ckv_p, stride_ckv_s, stride_ckv_d,
+    stride_kpe_p, stride_kpe_s, stride_kpe_d,
+    stride_idx_b, stride_idx_k,
+    stride_out_b, stride_out_h, stride_out_d,
+    stride_lse_b, stride_lse_h,
     HEAD_DIM_CKV: tl.constexpr,
     HEAD_DIM_KPE: tl.constexpr,
-    TOPK: tl.constexpr
+    PAGE_SIZE: tl.constexpr,
+    SM_SCALE: tl.constexpr,
+    TOPK: tl.constexpr,
 ):
-    # Program ID setup
-    pid = tl.program_id(0)
-    cur_head_idx = pid % 16
-    cur_token_idx = pid // 16
-
-    # Dimension offsets
+    """
+    Main kernel: compute sparse attention for one (token, head) pair.
+    Uses online softmax algorithm for numerical stability.
+    """
+    b_idx = tl.program_id(0)
+    h_idx = tl.program_id(1)
+    
+    # Dimension offsets with mask for safety
     offs_ckv = tl.arange(0, HEAD_DIM_CKV)
     offs_kpe = tl.arange(0, HEAD_DIM_KPE)
-
-    # 1. Load Queries
-    # Q_nope: [num_tokens, 16, 512]
-    qn_ptr = Q_Nope_ptr + (cur_token_idx * stride_qn_t) + (cur_head_idx * stride_qn_h) + (offs_ckv * stride_qn_d)
-    q_nope = tl.load(qn_ptr).to(tl.float32)
-
-    # Q_pe: [num_tokens, 16, 64]
-    qp_ptr = Q_Pe_ptr + (cur_token_idx * stride_qp_t) + (cur_head_idx * stride_qp_h) + (offs_kpe * stride_qp_d)
-    q_pe = tl.load(qp_ptr).to(tl.float32)
-
-    # 2. Online Softmax Accumulators
-    # m_i: max logit (initialized to -inf)
-    # l_i: sum exp
-    # acc: weighted sum
-    m_i = -float("inf")
-    l_i = 0.0
+    
+    # Create masks for dimension bounds
+    ckv_mask = offs_ckv < HEAD_DIM_CKV
+    kpe_mask = offs_kpe < HEAD_DIM_KPE
+    
+    # Load query vectors with mask
+    q_nope_ptrs = q_nope_ptr + b_idx * stride_qn_b + h_idx * stride_qn_h + offs_ckv * stride_qn_d
+    q_nope = tl.load(q_nope_ptrs, mask=ckv_mask, other=0.0).to(tl.float32)
+    
+    q_pe_ptrs = q_pe_ptr + b_idx * stride_qp_b + h_idx * stride_qp_h + offs_kpe * stride_qp_d
+    q_pe = tl.load(q_pe_ptrs, mask=kpe_mask, other=0.0).to(tl.float32)
+    
+    # Online softmax state - use large negative value
+    NEG_INF = -1e9
+    max_val = NEG_INF
+    sum_exp = 0.0
+    
+    # Accumulator for output
     acc = tl.zeros([HEAD_DIM_CKV], dtype=tl.float32)
-
-    # 3. Loop over TopK indices
-    for start_n in range(0, TOPK, BLOCK_N):
-        offs_n = start_n + tl.arange(0, BLOCK_N)
-
-        # Load Sparse Indices: [num_tokens, 2048]
-        idx_ptr = Indices_ptr + (cur_token_idx * stride_idx_t) + (offs_n * stride_idx_k)
-        indices = tl.load(idx_ptr)
-
-        # Handle padding (-1)
-        mask_valid = indices != -1
-
-        # For page_size=64, indices encode (page_idx * 64 + offset)
-        # Decode: page_idx = index // 64, offset = index % 64
-        PAGE_SIZE = 64
-        page_idx = indices // PAGE_SIZE
-        page_offset = indices % PAGE_SIZE
-
-        # Indirect Memory Access (Gather from Page Cache)
-        # CKV: [num_pages, page_size, 512]
-        # Ptr = base + page_idx * stride_p + page_offset * stride_ps + dim * stride_d
-        ckv_loc = (page_idx[:, None] * stride_ckv_p) + (page_offset[:, None] * stride_ckv_ps) + (offs_ckv[None, :] * stride_ckv_d)
-        kpe_loc = (page_idx[:, None] * stride_kpe_p) + (page_offset[:, None] * stride_kpe_ps) + (offs_kpe[None, :] * stride_kpe_d)
-
-        ckv_ptrs = CKV_ptr + ckv_loc
-        kpe_ptrs = KPE_ptr + kpe_loc
-
-        # Load KVs with masking for invalid pages
-        # mask needs to be broadcasted to [BLOCK_N, HEAD_DIM]
-        kc = tl.load(ckv_ptrs, mask=mask_valid[:, None], other=0.0).to(tl.float32)
-        kp = tl.load(kpe_ptrs, mask=mask_valid[:, None], other=0.0).to(tl.float32)
-
-        # Compute Attention Scores: (Qn * Kc) + (Qp * Kp)
-        # q_nope[None, :] broadcasts [512] -> [1, 512]
-        # kc is [BLOCK_N, 512]
-        # result of multiplication is [BLOCK_N, 512]
-        # sum(axis=1) -> [BLOCK_N]
-        score_n = tl.sum(q_nope[None, :] * kc, axis=1)
-        score_p = tl.sum(q_pe[None, :] * kp, axis=1)
-        
-        scores = (score_n + score_p) * sm_scale
-        
-        # Mask padded scores to -inf
-        scores = tl.where(mask_valid, scores, -float("inf"))
-
-        # Online Softmax Update
-        # 1. Compute max of current block
-        m_curr = tl.max(scores, 0)
-        
-        # 2. Update global max
-        # FIX: Use tl.maximum for element-wise max between scalar accumulator and new scalar
-        m_new = tl.maximum(m_i, m_curr)
-        
-        # 3. Compute Exponentials
-        p = tl.exp(scores - m_new)
-        alpha = tl.exp(m_i - m_new)
-        
-        # 4. Update Denominator
-        l_i = l_i * alpha + tl.sum(p, 0)
-        
-        # 5. Update Numerator (Accumulator)
-        # acc = acc * alpha + p @ kc
-        # p[:, None] -> [BLOCK_N, 1], kc -> [BLOCK_N, 512]
-        weighted_v = tl.sum(p[:, None] * kc, axis=0)
-        acc = acc * alpha + weighted_v
-        
-        m_i = m_new
-
-    # 4. Finalize Output
-    out = acc / l_i
     
-    # Store Output
-    out_off = (cur_token_idx * stride_out_t) + (cur_head_idx * stride_out_h) + (offs_ckv * stride_out_d)
-    tl.store(Out_ptr + out_off, out.to(tl.bfloat16))
-
-    # Compute and Store LSE (Base 2)
-    # Result = log2(sum(e^x)) = (log(l_i) + m_i) * log2(e)
-    LOG2_E = 1.44269504
-    lse_val = (tl.log(l_i) + m_i) * LOG2_E
+    # Process all TOPK entries
+    for k_idx in range(TOPK):
+        # Load sparse index
+        sparse_idx = tl.load(indices_ptr + b_idx * stride_idx_b + k_idx * stride_idx_k)
+        
+        # Handle padding (-1 means invalid entry)
+        valid = sparse_idx >= 0
+        
+        # Compute page and offset (only used when valid)
+        page_idx = tl.where(valid, sparse_idx // PAGE_SIZE, 0)
+        page_offset = tl.where(valid, sparse_idx % PAGE_SIZE, 0)
+        
+        # Load K vectors with MASK to prevent out-of-bounds access
+        k_ckv_ptrs = ckv_ptr + page_idx * stride_ckv_p + page_offset * stride_ckv_s + offs_ckv * stride_ckv_d
+        k_ckv = tl.load(k_ckv_ptrs, mask=valid & ckv_mask, other=0.0, eviction_policy="evict_last").to(tl.float32)
+        
+        k_kpe_ptrs = kpe_ptr + page_idx * stride_kpe_p + page_offset * stride_kpe_s + offs_kpe * stride_kpe_d
+        k_kpe = tl.load(k_kpe_ptrs, mask=valid & kpe_mask, other=0.0, eviction_policy="evict_last").to(tl.float32)
+        
+        # Compute logit: (q_nope · k_ckv) + (q_pe · k_kpe)
+        dot_ckv = tl.sum(q_nope * k_ckv, axis=0)
+        dot_kpe = tl.sum(q_pe * k_kpe, axis=0)
+        
+        # Compute scaled logit, use NEG_INF for invalid entries
+        logit = tl.where(valid, (dot_ckv + dot_kpe) * SM_SCALE, NEG_INF)
+        
+        # Online softmax update with numerical stability
+        new_max = tl.maximum(max_val, logit)
+        
+        # Compute rescale factor safely
+        # When max_val is NEG_INF, max_val - new_max could be problematic
+        # But exp(NEG_INF - anything_finite) = 0, which is correct
+        rescale = tl.exp(max_val - new_max)
+        
+        # Update accumulator with rescaling
+        acc = acc * rescale
+        
+        # Compute weight - 0 for invalid entries
+        weight = tl.where(valid, tl.exp(logit - new_max), 0.0)
+        
+        # Update sum_exp
+        sum_exp = sum_exp * rescale + weight
+        
+        # Accumulate weighted K
+        acc = acc + weight * k_ckv
+        
+        # Update max
+        max_val = new_max
     
-    lse_off = (cur_token_idx * stride_lse_t) + (cur_head_idx * stride_lse_h)
-    tl.store(Lse_ptr + lse_off, lse_val.to(tl.float32))
+    # Safe normalization - handle case when all entries are invalid
+    out = tl.where(sum_exp > 0, acc / sum_exp, tl.zeros([HEAD_DIM_CKV], dtype=tl.float32))
+    
+    # Store output as bfloat16 with mask
+    out_ptrs = output_ptr + b_idx * stride_out_b + h_idx * stride_out_h + offs_ckv * stride_out_d
+    tl.store(out_ptrs, out.to(tl.bfloat16), mask=ckv_mask)
+    
+    # LSE in log2 base: log2(sum_exp) + max_val / ln(2)
+    ln2 = 0.6931471805599453
+    lse_val = tl.where(
+        sum_exp > 0,
+        (max_val + tl.log(sum_exp)) / ln2,
+        NEG_INF
+    )
+    tl.store(lse_ptr + b_idx * stride_lse_b + h_idx * stride_lse_h, lse_val)
 
 
-def dsa_sparse_attention_h16_ckv512_kpe64_topk2048_ps64(
-    q_nope, q_pe, ckv_cache, kpe_cache, sparse_indices, sm_scale
-):
+def kernel(
+    q_nope: torch.Tensor,
+    q_pe: torch.Tensor,
+    ckv_cache: torch.Tensor,
+    kpe_cache: torch.Tensor,
+    sparse_indices: torch.Tensor,
+    sm_scale: float,
+    output: torch.Tensor,
+    lse: torch.Tensor,
+) -> None:
     """
-    Batched Native Sparse Attention (DSA) with sparse TopK KV cache selection.
-    Arguments match the definition inputs exactly.
+    DSA Sparse Attention kernel (Destination-Passing Style).
 
-    For page_size=64, sparse_indices encode (page_idx * 64 + offset).
+    Args:
+        q_nope: [num_tokens, num_qo_heads, head_dim_ckv] - Query without positional encoding
+        q_pe: [num_tokens, num_qo_heads, head_dim_kpe] - Query positional encoding
+        ckv_cache: [num_pages, page_size, head_dim_ckv] - Compressed KV cache
+        kpe_cache: [num_pages, page_size, head_dim_kpe] - Key positional encoding cache
+        sparse_indices: [num_tokens, topk] - Sparse indices for top-K selection
+        sm_scale: Softmax scale factor
+        output: [num_tokens, num_qo_heads, head_dim_ckv] - Pre-allocated output tensor
+        lse: [num_tokens, num_qo_heads] - Pre-allocated LSE tensor
     """
-    # 1. Check Dimensions & Constraints
-    num_tokens, num_qo_heads, head_dim_ckv = q_nope.shape
+    num_tokens, num_heads, head_dim_ckv = q_nope.shape
     head_dim_kpe = q_pe.shape[-1]
     num_pages, page_size, _ = ckv_cache.shape
     topk = sparse_indices.shape[-1]
 
-    assert num_qo_heads == 16, f"num_qo_heads must be 16, got {num_qo_heads}"
-    assert head_dim_ckv == 512, f"head_dim_ckv must be 512, got {head_dim_ckv}"
-    assert head_dim_kpe == 64, f"head_dim_kpe must be 64, got {head_dim_kpe}"
-    assert page_size == 64, f"page_size must be 64, got {page_size}"
-    assert topk == 2048, f"topk must be 2048, got {topk}"
-
-    assert sparse_indices.shape[0] == num_tokens
-    assert sparse_indices.shape[-1] == topk
-    assert ckv_cache.shape[1] == page_size
-
     device = q_nope.device
 
-    # 2. Convert sparse_indices from flat indices to (page_idx, offset) for kernel
-    # For page_size=64, indices encode (page_idx * 64 + offset)
-    # We need to decode them for proper memory access
-    # sparse_indices: [num_tokens, topk] with values encoding page_idx*64 + offset
-    # We'll pass both the encoded indices and the page_size to the kernel
+    # Verify output tensors are pre-allocated
+    assert output.shape == (num_tokens, num_heads, head_dim_ckv), f"Output shape mismatch: {output.shape} vs {(num_tokens, num_heads, head_dim_ckv)}"
+    assert lse.shape == (num_tokens, num_heads), f"LSE shape mismatch: {lse.shape} vs {(num_tokens, num_heads)}"
 
-    # 3. Allocate Outputs
-    output = torch.empty(
-        (num_tokens, num_qo_heads, head_dim_ckv),
-        dtype=torch.bfloat16,
-        device=device
-    )
-    lse = torch.empty(
-        (num_tokens, num_qo_heads),
-        dtype=torch.float32,
-        device=device
-    )
+    grid = (num_tokens, num_heads)
 
-    # 4. Kernel Launch
-    grid = (num_tokens * num_qo_heads, 1, 1)
-
-    _kernel_dsa_sparse[grid](
-        q_nope, q_pe,
-        ckv_cache, kpe_cache,
-        sparse_indices,
-        output, lse,
-        # Strides
+    # Launch kernel with optimized settings for B200
+    _dsa_sparse_attention_kernel[grid](
+        q_nope, q_pe, ckv_cache, kpe_cache, sparse_indices, output, lse,
         q_nope.stride(0), q_nope.stride(1), q_nope.stride(2),
         q_pe.stride(0), q_pe.stride(1), q_pe.stride(2),
         ckv_cache.stride(0), ckv_cache.stride(1), ckv_cache.stride(2),
@@ -212,83 +167,11 @@ def dsa_sparse_attention_h16_ckv512_kpe64_topk2048_ps64(
         sparse_indices.stride(0), sparse_indices.stride(1),
         output.stride(0), output.stride(1), output.stride(2),
         lse.stride(0), lse.stride(1),
-        # Scalar
-        sm_scale,
-        # Constants
-        BLOCK_N=BLOCK_N,
-        HEAD_DIM_CKV=HEAD_DIM_CKV,
-        HEAD_DIM_KPE=HEAD_DIM_KPE,
-        TOPK=TOPK
+        HEAD_DIM_CKV=head_dim_ckv,
+        HEAD_DIM_KPE=head_dim_kpe,
+        PAGE_SIZE=page_size,
+        SM_SCALE=sm_scale,
+        TOPK=topk,
+        num_warps=4,
+        num_stages=2,
     )
-
-    return output, lse
-    torch.manual_seed(0)
-    
-    # Test Config
-    num_tokens = 4
-    num_heads = 16
-    d_ckv = 512
-    d_kpe = 64
-    topk = 2048
-    num_pages = 5000
-    
-    # Inputs
-    q_nope = torch.randn(num_tokens, num_heads, d_ckv, device='cuda', dtype=torch.bfloat16)
-    q_pe = torch.randn(num_tokens, num_heads, d_kpe, device='cuda', dtype=torch.bfloat16)
-    
-    # Cache (Page Size = 1)
-    ckv_cache = torch.randn(num_pages, 1, d_ckv, device='cuda', dtype=torch.bfloat16)
-    kpe_cache = torch.randn(num_pages, 1, d_kpe, device='cuda', dtype=torch.bfloat16)
-    
-    # Sparse Indices (Randomly select pages, simulate some -1 padding)
-    indices = torch.randint(0, num_pages, (num_tokens, topk), device='cuda', dtype=torch.int32)
-    # Mask last few to -1 to test padding logic
-    indices[:, -10:] = -1
-    
-    sm_scale = 1.0 / math.sqrt(d_ckv)
-
-    # Reference Implementation
-    from torch.nn.functional import softmax
-    
-    # Import or define the torch run function provided in the prompt
-    # (Here we just assume the 'run' function from the prompt is available or reimplement logic for check)
-    def torch_ref(q_nope, q_pe, ckv_cache, kpe_cache, sparse_indices, sm_scale):
-        # ... Copy of the provided torch code ...
-        Kc_all = ckv_cache.squeeze(1).float()
-        Kp_all = kpe_cache.squeeze(1).float()
-        out = torch.zeros_like(q_nope)
-        lse_ref = torch.full((num_tokens, num_heads), -float("inf"), device=q_nope.device)
-        
-        for t in range(num_tokens):
-            idx = sparse_indices[t]
-            valid = idx != -1
-            idx_v = idx[valid].long()
-            if len(idx_v) == 0: continue
-            
-            kc = Kc_all[idx_v]
-            kp = Kp_all[idx_v]
-            qn = q_nope[t].float()
-            qp = q_pe[t].float()
-            
-            logits = (qn @ kc.T) + (qp @ kp.T)
-            logits_scaled = logits * sm_scale
-            
-            lse_ref[t] = torch.logsumexp(logits_scaled, dim=-1) / math.log(2.0)
-            attn = torch.softmax(logits_scaled, dim=-1)
-            out[t] = (attn @ kc).to(torch.bfloat16)
-        return out, lse_ref
-
-    # Run Reference
-    ref_out, ref_lse = torch_ref(q_nope, q_pe, ckv_cache, kpe_cache, indices, sm_scale)
-    
-    # Run Triton
-    tri_out, tri_lse = dsa_sparse_attention_h16_ckv512_kpe64_topk2048_ps1(
-        q_nope, q_pe, ckv_cache, kpe_cache, indices, sm_scale
-    )
-    
-    # Verification
-    print(f"Max Diff Output: {(ref_out - tri_out).abs().max().item()}")
-    print(f"Max Diff LSE: {(ref_lse - tri_lse).abs().max().item()}")
-    
-    assert torch.allclose(ref_out, tri_out, atol=1e-2, rtol=1e-2)
-    print("Verification Passed!")
