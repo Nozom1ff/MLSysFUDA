@@ -1,15 +1,6 @@
-"""
-Triton Kernel Template for FlashInfer Competition.
-
-Implement your kernel logic here. The entry point function name should match
-the `entry_point` setting in config.toml.
-
-See the track definition for required function signature and semantics.
-"""
-
+import torch
 import triton
 import triton.language as tl
-import torch
 import math
 
 # 定义常量以提高可读性
@@ -18,6 +9,74 @@ HEAD_DIM_CKV = 512
 HEAD_DIM_KPE = 64
 TOPK = 2048
 NUM_HEADS = 16
+
+
+import math
+import torch
+
+
+@torch.no_grad()
+def torch_ref(q_nope, q_pe, ckv_cache, kpe_cache, sparse_indices, sm_scale):
+    num_tokens, num_qo_heads, head_dim_ckv = q_nope.shape
+    head_dim_kpe = q_pe.shape[-1]
+    page_size = ckv_cache.shape[1]
+    topk = sparse_indices.shape[-1]
+
+    # Check constants
+    assert num_qo_heads == 16
+    assert head_dim_ckv == 512
+    assert head_dim_kpe == 64
+    assert page_size == 1
+    assert topk == 2048
+
+    # Check constraints
+    assert sparse_indices.shape[0] == num_tokens
+    assert sparse_indices.shape[-1] == topk
+    assert ckv_cache.shape[1] == page_size
+
+    device = q_nope.device
+
+    # Squeeze page dimension (page_size=1)
+    Kc_all = ckv_cache.squeeze(1).to(torch.float32)  # [num_pages, head_dim_ckv]
+    Kp_all = kpe_cache.squeeze(1).to(torch.float32)  # [num_pages, head_dim_kpe]
+
+    output = torch.zeros(
+        (num_tokens, num_qo_heads, head_dim_ckv), dtype=torch.bfloat16, device=device
+    )
+    lse = torch.full((num_tokens, num_qo_heads), -float("inf"), dtype=torch.float32, device=device)
+
+    for t in range(num_tokens):
+        indices = sparse_indices[t]  # [topk]
+
+        # Handle padding: -1 indicates invalid indices
+        valid_mask = indices != -1
+        valid_indices = indices[valid_mask]
+
+        if valid_indices.numel() == 0:
+            output[t].zero_()
+            continue
+
+        tok_idx = valid_indices.to(torch.long)
+
+        Kc = Kc_all[tok_idx]  # [num_valid, head_dim_ckv]
+        Kp = Kp_all[tok_idx]  # [num_valid, head_dim_kpe]
+        qn = q_nope[t].to(torch.float32)  # [num_qo_heads, head_dim_ckv]
+        qp = q_pe[t].to(torch.float32)  # [num_qo_heads, head_dim_kpe]
+
+        # Compute attention logits
+        logits = (qn @ Kc.T) + (qp @ Kp.T)  # [num_qo_heads, num_valid]
+        logits_scaled = logits * sm_scale
+
+        # Compute 2-base LSE
+        lse[t] = torch.logsumexp(logits_scaled, dim=-1) / math.log(2.0)
+
+        # Compute attention output
+        attn = torch.softmax(logits_scaled, dim=-1)  # [num_qo_heads, num_valid]
+        out = attn @ Kc  # [num_qo_heads, head_dim_ckv]
+        output[t] = out.to(torch.bfloat16)
+
+    return output, lse
+
 
 @triton.jit
 def _kernel_dsa_sparse(
@@ -79,18 +138,12 @@ def _kernel_dsa_sparse(
         # Handle padding (-1)
         mask_valid = indices != -1
 
-        # For page_size=64, indices encode (page_idx * 64 + offset)
-        # Decode: page_idx = index // 64, offset = index % 64
-        PAGE_SIZE = 64
-        page_idx = indices // PAGE_SIZE
-        page_offset = indices % PAGE_SIZE
-
         # Indirect Memory Access (Gather from Page Cache)
-        # CKV: [num_pages, page_size, 512]
-        # Ptr = base + page_idx * stride_p + page_offset * stride_ps + dim * stride_d
-        ckv_loc = (page_idx[:, None] * stride_ckv_p) + (page_offset[:, None] * stride_ckv_ps) + (offs_ckv[None, :] * stride_ckv_d)
-        kpe_loc = (page_idx[:, None] * stride_kpe_p) + (page_offset[:, None] * stride_kpe_ps) + (offs_kpe[None, :] * stride_kpe_d)
-
+        # CKV: [num_pages, 1, 512]
+        # Ptr = base + page_idx * stride_p + offset * stride_d
+        ckv_loc = (indices[:, None] * stride_ckv_p) + (offs_ckv[None, :] * stride_ckv_d)
+        kpe_loc = (indices[:, None] * stride_kpe_p) + (offs_kpe[None, :] * stride_kpe_d)
+        
         ckv_ptrs = CKV_ptr + ckv_loc
         kpe_ptrs = KPE_ptr + kpe_loc
 
@@ -151,25 +204,23 @@ def _kernel_dsa_sparse(
     tl.store(Lse_ptr + lse_off, lse_val.to(tl.float32))
 
 
-def dsa_sparse_attention_h16_ckv512_kpe64_topk2048_ps64(
+def dsa_sparse_attention_h16_ckv512_kpe64_topk2048_ps1(
     q_nope, q_pe, ckv_cache, kpe_cache, sparse_indices, sm_scale
 ):
     """
     Batched Native Sparse Attention (DSA) with sparse TopK KV cache selection.
     Arguments match the definition inputs exactly.
-
-    For page_size=64, sparse_indices encode (page_idx * 64 + offset).
     """
     # 1. Check Dimensions & Constraints
     num_tokens, num_qo_heads, head_dim_ckv = q_nope.shape
     head_dim_kpe = q_pe.shape[-1]
-    num_pages, page_size, _ = ckv_cache.shape
+    page_size = ckv_cache.shape[1]
     topk = sparse_indices.shape[-1]
 
     assert num_qo_heads == 16, f"num_qo_heads must be 16, got {num_qo_heads}"
     assert head_dim_ckv == 512, f"head_dim_ckv must be 512, got {head_dim_ckv}"
     assert head_dim_kpe == 64, f"head_dim_kpe must be 64, got {head_dim_kpe}"
-    assert page_size == 64, f"page_size must be 64, got {page_size}"
+    assert page_size == 1, f"page_size must be 1, got {page_size}"
     assert topk == 2048, f"topk must be 2048, got {topk}"
 
     assert sparse_indices.shape[0] == num_tokens
@@ -178,27 +229,21 @@ def dsa_sparse_attention_h16_ckv512_kpe64_topk2048_ps64(
 
     device = q_nope.device
 
-    # 2. Convert sparse_indices from flat indices to (page_idx, offset) for kernel
-    # For page_size=64, indices encode (page_idx * 64 + offset)
-    # We need to decode them for proper memory access
-    # sparse_indices: [num_tokens, topk] with values encoding page_idx*64 + offset
-    # We'll pass both the encoded indices and the page_size to the kernel
-
-    # 3. Allocate Outputs
+    # 2. Allocate Outputs
     output = torch.empty(
-        (num_tokens, num_qo_heads, head_dim_ckv),
-        dtype=torch.bfloat16,
+        (num_tokens, num_qo_heads, head_dim_ckv), 
+        dtype=torch.bfloat16, 
         device=device
     )
     lse = torch.empty(
-        (num_tokens, num_qo_heads),
-        dtype=torch.float32,
+        (num_tokens, num_qo_heads), 
+        dtype=torch.float32, 
         device=device
     )
 
-    # 4. Kernel Launch
+    # 3. Kernel Launch
     grid = (num_tokens * num_qo_heads, 1, 1)
-
+    
     _kernel_dsa_sparse[grid](
         q_nope, q_pe,
         ckv_cache, kpe_cache,
@@ -222,6 +267,8 @@ def dsa_sparse_attention_h16_ckv512_kpe64_topk2048_ps64(
     )
 
     return output, lse
+# --- 验证代码 (用于测试正确性) ---
+if __name__ == "__main__":
     torch.manual_seed(0)
     
     # Test Config
