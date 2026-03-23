@@ -54,35 +54,32 @@ def _dsa_sparse_attention_kernel(
     
     # Accumulator for output
     acc = tl.zeros([HEAD_DIM_CKV], dtype=tl.float32)
-
-    # Pre-compute index base to avoid repeated calculation in loop
-    idx_base = b_idx * stride_idx_b
-
+    
     # Process all TOPK entries
     for k_idx in range(TOPK):
         # Load sparse index
-        sparse_idx = tl.load(indices_ptr + idx_base + k_idx * stride_idx_k)
-
+        sparse_idx = tl.load(indices_ptr + b_idx * stride_idx_b + k_idx * stride_idx_k)
+        
         # Handle padding (-1 means invalid entry)
         valid = sparse_idx >= 0
-
-        # Compute page and offset directly (mask handles invalid cases)
-        page_idx = sparse_idx // PAGE_SIZE
-        page_offset = sparse_idx % PAGE_SIZE
-
-        # Load K vectors with combined mask to prevent out-of-bounds access
-        load_mask_ckv = valid & ckv_mask
-        load_mask_kpe = valid & kpe_mask
-
+        
+        # Compute page and offset (only used when valid)
+        page_idx = tl.where(valid, sparse_idx // PAGE_SIZE, 0)
+        page_offset = tl.where(valid, sparse_idx % PAGE_SIZE, 0)
+        
+        # Load K vectors with MASK to prevent out-of-bounds access
         k_ckv_ptrs = ckv_ptr + page_idx * stride_ckv_p + page_offset * stride_ckv_s + offs_ckv * stride_ckv_d
-        k_ckv = tl.load(k_ckv_ptrs, mask=load_mask_ckv, other=0.0, eviction_policy="evict_last").to(tl.float32)
-
+        k_ckv = tl.load(k_ckv_ptrs, mask=valid & ckv_mask, other=0.0, eviction_policy="evict_last").to(tl.float32)
+        
         k_kpe_ptrs = kpe_ptr + page_idx * stride_kpe_p + page_offset * stride_kpe_s + offs_kpe * stride_kpe_d
-        k_kpe = tl.load(k_kpe_ptrs, mask=load_mask_kpe, other=0.0, eviction_policy="evict_last").to(tl.float32)
-
-        # Compute logit: (q_nope · k_ckv) + (q_pe · k_kpe), merged to reduce intermediates
-        logit = (tl.sum(q_nope * k_ckv, axis=0) + tl.sum(q_pe * k_kpe, axis=0)) * SM_SCALE
-        logit = tl.where(valid, logit, NEG_INF)
+        k_kpe = tl.load(k_kpe_ptrs, mask=valid & kpe_mask, other=0.0, eviction_policy="evict_last").to(tl.float32)
+        
+        # Compute logit: (q_nope · k_ckv) + (q_pe · k_kpe)
+        dot_ckv = tl.sum(q_nope * k_ckv, axis=0)
+        dot_kpe = tl.sum(q_pe * k_kpe, axis=0)
+        
+        # Compute scaled logit, use NEG_INF for invalid entries
+        logit = tl.where(valid, (dot_ckv + dot_kpe) * SM_SCALE, NEG_INF)
         
         # Online softmax update with numerical stability
         new_max = tl.maximum(max_val, logit)
