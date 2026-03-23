@@ -1,13 +1,7 @@
-"""
-DSA Sparse Attention Kernel - Fixed for Triton 3.x and B200.
-Handles sparse attention with TopK KV cache selection.
-Uses online softmax algorithm for numerical stability.
-"""
 from typing import Tuple
 import torch
 import triton
 import triton.language as tl
-
 
 @triton.jit
 def _dsa_sparse_attention_kernel(
@@ -24,103 +18,78 @@ def _dsa_sparse_attention_kernel(
     PAGE_SIZE: tl.constexpr,
     SM_SCALE: tl.constexpr,
     TOPK: tl.constexpr,
+    BLOCK_K: tl.constexpr,
 ):
-    """
-    Main kernel: compute sparse attention for one (token, head) pair.
-    Uses online softmax algorithm for numerical stability.
-    """
     b_idx = tl.program_id(0)
     h_idx = tl.program_id(1)
-    
-    # Dimension offsets with mask for safety
+
     offs_ckv = tl.arange(0, HEAD_DIM_CKV)
     offs_kpe = tl.arange(0, HEAD_DIM_KPE)
-    
-    # Create masks for dimension bounds
+
     ckv_mask = offs_ckv < HEAD_DIM_CKV
     kpe_mask = offs_kpe < HEAD_DIM_KPE
-    
-    # Load query vectors with mask
+
     q_nope_ptrs = q_nope_ptr + b_idx * stride_qn_b + h_idx * stride_qn_h + offs_ckv * stride_qn_d
     q_nope = tl.load(q_nope_ptrs, mask=ckv_mask, other=0.0).to(tl.float32)
-    
+
     q_pe_ptrs = q_pe_ptr + b_idx * stride_qp_b + h_idx * stride_qp_h + offs_kpe * stride_qp_d
     q_pe = tl.load(q_pe_ptrs, mask=kpe_mask, other=0.0).to(tl.float32)
-    
-    # Online softmax state - use large negative value
+
     NEG_INF = -1e9
     max_val = NEG_INF
     sum_exp = 0.0
-    
-    # Accumulator for output
     acc = tl.zeros([HEAD_DIM_CKV], dtype=tl.float32)
 
-    # Pre-compute index base to avoid repeated calculation in loop
-    idx_base = b_idx * stride_idx_b
+    idx_base = indices_ptr + b_idx * stride_idx_b
 
-    # Process all TOPK entries
-    for k_idx in range(TOPK):
-        # Load sparse index
-        sparse_idx = tl.load(indices_ptr + idx_base + k_idx * stride_idx_k)
+    for k_start in range(0, TOPK, BLOCK_K):
+        offs_k = tl.arange(0, BLOCK_K)
+        k_idx = k_start + offs_k
+        k_mask = k_idx < TOPK
 
-        # Handle padding (-1 means invalid entry)
-        valid = sparse_idx >= 0
+        sparse_idx = tl.load(idx_base + k_idx * stride_idx_k, mask=k_mask, other=-1)
+        valid = (sparse_idx >= 0) & k_mask
 
-        # Compute page and offset directly (mask handles invalid cases)
-        page_idx = sparse_idx // PAGE_SIZE
-        page_offset = sparse_idx % PAGE_SIZE
+        safe_idx = tl.where(valid, sparse_idx, 0)
+        page_idx = safe_idx // PAGE_SIZE
+        page_offset = safe_idx % PAGE_SIZE
 
-        # Load K vectors with combined mask to prevent out-of-bounds access
-        load_mask_ckv = valid & ckv_mask
-        load_mask_kpe = valid & kpe_mask
+        load_mask_ckv = valid[:, None] & ckv_mask[None, :]
+        load_mask_kpe = valid[:, None] & kpe_mask[None, :]
 
-        k_ckv_ptrs = ckv_ptr + page_idx * stride_ckv_p + page_offset * stride_ckv_s + offs_ckv * stride_ckv_d
+        k_ckv_ptrs = ckv_ptr + page_idx[:, None] * stride_ckv_p + page_offset[:, None] * stride_ckv_s + offs_ckv[None, :] * stride_ckv_d
         k_ckv = tl.load(k_ckv_ptrs, mask=load_mask_ckv, other=0.0, eviction_policy="evict_last").to(tl.float32)
 
-        k_kpe_ptrs = kpe_ptr + page_idx * stride_kpe_p + page_offset * stride_kpe_s + offs_kpe * stride_kpe_d
+        k_kpe_ptrs = kpe_ptr + page_idx[:, None] * stride_kpe_p + page_offset[:, None] * stride_kpe_s + offs_kpe[None, :] * stride_kpe_d
         k_kpe = tl.load(k_kpe_ptrs, mask=load_mask_kpe, other=0.0, eviction_policy="evict_last").to(tl.float32)
 
-        # Compute logit: (q_nope · k_ckv) + (q_pe · k_kpe), merged to reduce intermediates
-        logit = (tl.sum(q_nope * k_ckv, axis=0) + tl.sum(q_pe * k_kpe, axis=0)) * SM_SCALE
+        dot_ckv = tl.sum(q_nope[None, :] * k_ckv, axis=1)
+        dot_kpe = tl.sum(q_pe[None, :] * k_kpe, axis=1)
+
+        logit = (dot_ckv + dot_kpe) * SM_SCALE
         logit = tl.where(valid, logit, NEG_INF)
-        
-        # Online softmax update with numerical stability
-        new_max = tl.maximum(max_val, logit)
-        
-        # Compute rescale factor safely
-        # When max_val is NEG_INF, max_val - new_max could be problematic
-        # But exp(NEG_INF - anything_finite) = 0, which is correct
+
+        block_max = tl.max(logit, axis=0)
+        new_max = tl.maximum(max_val, block_max)
+
         rescale = tl.exp(max_val - new_max)
-        
-        # Update accumulator with rescaling
         acc = acc * rescale
-        
-        # Compute weight - 0 for invalid entries
+
         weight = tl.where(valid, tl.exp(logit - new_max), 0.0)
-        
-        # Update sum_exp
-        sum_exp = sum_exp * rescale + weight
-        
-        # Accumulate weighted K
-        acc = acc + weight * k_ckv
-        
-        # Update max
+
+        sum_exp = sum_exp * rescale + tl.sum(weight, axis=0)
+
+        acc = acc + tl.sum(weight[:, None] * k_ckv, axis=0)
+
         max_val = new_max
-    
-    # Safe normalization - handle case when all entries are invalid
-    out = tl.where(sum_exp > 0, acc / sum_exp, tl.zeros([HEAD_DIM_CKV], dtype=tl.float32))
-    
-    # Store output as bfloat16 with mask
+
+    out = tl.where(sum_exp > 0, acc / sum_exp, 0.0)
+
     out_ptrs = output_ptr + b_idx * stride_out_b + h_idx * stride_out_h + offs_ckv * stride_out_d
     tl.store(out_ptrs, out.to(tl.bfloat16), mask=ckv_mask)
-    
-    # LSE in log2 base: log2(sum_exp) + max_val / ln(2)
+
     ln2 = 0.6931471805599453
-    lse_val = tl.where(
-        sum_exp > 0,
-        (max_val + tl.log(sum_exp)) / ln2,
-        NEG_INF
-    )
+    lse_val = tl.where(sum_exp > 0, (max_val + tl.log(sum_exp)) / ln2, NEG_INF)
     tl.store(lse_ptr + b_idx * stride_lse_b + h_idx * stride_lse_h, lse_val)
 
 
@@ -134,33 +103,16 @@ def kernel(
     output: torch.Tensor,
     lse: torch.Tensor,
 ) -> None:
-    """
-    DSA Sparse Attention kernel (Destination-Passing Style).
-
-    Args:
-        q_nope: [num_tokens, num_qo_heads, head_dim_ckv] - Query without positional encoding
-        q_pe: [num_tokens, num_qo_heads, head_dim_kpe] - Query positional encoding
-        ckv_cache: [num_pages, page_size, head_dim_ckv] - Compressed KV cache
-        kpe_cache: [num_pages, page_size, head_dim_kpe] - Key positional encoding cache
-        sparse_indices: [num_tokens, topk] - Sparse indices for top-K selection
-        sm_scale: Softmax scale factor
-        output: [num_tokens, num_qo_heads, head_dim_ckv] - Pre-allocated output tensor
-        lse: [num_tokens, num_qo_heads] - Pre-allocated LSE tensor
-    """
     num_tokens, num_heads, head_dim_ckv = q_nope.shape
     head_dim_kpe = q_pe.shape[-1]
     num_pages, page_size, _ = ckv_cache.shape
     topk = sparse_indices.shape[-1]
 
-    device = q_nope.device
-
-    # Verify output tensors are pre-allocated
-    assert output.shape == (num_tokens, num_heads, head_dim_ckv), f"Output shape mismatch: {output.shape} vs {(num_tokens, num_heads, head_dim_ckv)}"
-    assert lse.shape == (num_tokens, num_heads), f"LSE shape mismatch: {lse.shape} vs {(num_tokens, num_heads)}"
+    assert output.shape == (num_tokens, num_heads, head_dim_ckv), "Output shape mismatch"
+    assert lse.shape == (num_tokens, num_heads), "LSE shape mismatch"
 
     grid = (num_tokens, num_heads)
 
-    # Launch kernel with optimized settings for B200
     _dsa_sparse_attention_kernel[grid](
         q_nope, q_pe, ckv_cache, kpe_cache, sparse_indices, output, lse,
         q_nope.stride(0), q_nope.stride(1), q_nope.stride(2),
@@ -175,6 +127,7 @@ def kernel(
         PAGE_SIZE=page_size,
         SM_SCALE=sm_scale,
         TOPK=topk,
+        BLOCK_K=8,
         num_warps=4,
-        num_stages=2,
+        num_stages=4,
     )

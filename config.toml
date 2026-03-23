@@ -1,5 +1,5 @@
 [solution]
-name = "FUDA-solution-v3"      # Solution name
+name = "FUDA-solution-v8"      # Solution name
 definition = "dsa_sparse_attention_h16_ckv512_kpe64_topk2048_ps64"  # DSA sparse attention
 author = "FUDA"              # Team/author name
 

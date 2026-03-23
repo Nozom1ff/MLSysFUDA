@@ -219,3 +219,4 @@ __marimo__/
 .claude/
 tmp/
 kernel_profiler_analysis.py
+solution/triton/backup/
