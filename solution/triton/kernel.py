@@ -133,9 +133,7 @@ def _dsa_sparse_attention_kernel(
     tl.store(lse_ptrs, lse_val, mask=h_mask)
 
 
-# =========================================================================
-# ⚠️ Python 接口完全不变，任何系统直接 import 并调用 kernel() 即可 ⚠️
-# =========================================================================
+
 def kernel(
     q_nope: torch.Tensor,
     q_pe: torch.Tensor,
@@ -161,13 +159,10 @@ def kernel(
     assert output.shape == (num_tokens, num_heads, head_dim_ckv), f"Output shape mismatch: {output.shape} vs {(num_tokens, num_heads, head_dim_ckv)}"
     assert lse.shape == (num_tokens, num_heads), f"LSE shape mismatch: {lse.shape} vs {(num_tokens, num_heads)}"
 
-    # -------------------------------------------------------------
-    # B200 专属性能调参配置 (动态计算传入，不改变外部接口)
-    # -------------------------------------------------------------
-    BLOCK_H = 16  # 将 16 个 Head 分成一组处理（极大节省内存带宽，完美适配 MLA）
-    BLOCK_K = 32  # 每次从 HBM 批量读取 32 个 Key（适配 Tensor Core 的矩阵维度）
+
+    BLOCK_H = 16 
+    BLOCK_K = 32 
     
-    # 调整 Grid：原先是一个 Token 一个 Head 占一个 Block，现在是每 16 个 Head 占一个 Block
     grid = (num_tokens, triton.cdiv(num_heads, BLOCK_H))
 
     # Launch kernel with optimized settings for B200
@@ -180,14 +175,14 @@ def kernel(
         sparse_indices.stride(0), sparse_indices.stride(1),
         output.stride(0), output.stride(1), output.stride(2),
         lse.stride(0), lse.stride(1),
-        NUM_HEADS=num_heads,          # 新增：用于越界安全检查
+        NUM_HEADS=num_heads,         
         HEAD_DIM_CKV=head_dim_ckv,
         HEAD_DIM_KPE=head_dim_kpe,
         PAGE_SIZE=page_size,
         SM_SCALE=sm_scale,
         TOPK=topk,
-        BLOCK_H=BLOCK_H,              # 动态传入 Block 维度
-        BLOCK_K=BLOCK_K,              # 动态传入 Block 维度
+        BLOCK_H=BLOCK_H,              
+        BLOCK_K=BLOCK_K,             
         num_warps=4,
-        num_stages=3,                 # B200 推荐：使用 3 到 4 以便让 TMA 完全掩盖离散内存读取延迟
+        num_stages=3,                
     )
